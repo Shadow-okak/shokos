@@ -55,7 +55,7 @@ Adafruit_NeoPixel pixel(1, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
 Adafruit_BME280 bme;
 bool bmeOK = false;
 
-// ---------- Состояние UI ----------
+// ---------- UI state ----------
 enum Screen {
   SCREEN_HOME,
   SCREEN_CLOCK,
@@ -70,7 +70,7 @@ enum Screen {
 
 Screen currentScreen = SCREEN_HOME;
 int    focusTile = 0;
-int    lastSw    = HIGH;
+int    lastSw = HIGH;
 
 // ---------- Данные ----------
 float temperature = 0, humidity = 0, pressure = 0;
@@ -385,7 +385,6 @@ void setup() {
   Serial.println("\n=== MAIN SYSTEM (UI) ===");
   bootTime = millis();
 
-  // SW удержание >3 сек → preloader
   pinMode(JOY_SW_PIN, INPUT_PULLUP);
   delay(50);
   if (digitalRead(JOY_SW_PIN) == LOW) {
@@ -415,13 +414,12 @@ void setup() {
   spr.setColorDepth(16);
   spr.createSprite(320, 240);
 
-  // Загрузка калибровки джойстика
   loadJoyCal();
   if (!joyCal.valid) {
     Serial.println("No joystick calibration -> running wizard");
     runCalibration(spr);
   } else {
-    Serial.printf("JoyCal loaded: X c=%d r=%d..%d, Y c=%d r=%d..%d, dz=%d%%\n",
+    Serial.printf("JoyCal: X c=%d r=%d..%d, Y c=%d r=%d..%d, dz=%d%%\n",
                   joyCal.xCenter, joyCal.xMin, joyCal.xMax,
                   joyCal.yCenter, joyCal.yMin, joyCal.yMax,
                   joyCal.deadzonePercent);
@@ -442,30 +440,45 @@ void setup() {
 }
 
 void loop() {
-  int jx = joyXNorm();
+  int jx = joyXNorm();   // -100..+100
   int jy = joyYNorm();
   int sw = digitalRead(JOY_SW_PIN);
 
   bool redraw = false;
-  const int TRIG = 40;
 
-  // ---- Навигация ----
+  // ---- Аналоговая навигация с ускорением ----
+  static unsigned long lastScrollX = 0;
+  static unsigned long lastScrollY = 0;
+
   if (currentScreen == SCREEN_HOME) {
-    if (jx < -TRIG) {
-      int col = focusTile % TILE_COLS;
-      if (col > 0) { focusTile--; redraw = true; }
-      delay(200);
-    } else if (jx > TRIG) {
-      int col = focusTile % TILE_COLS;
-      if (col < TILE_COLS - 1) { focusTile++; redraw = true; }
-      delay(200);
+    if (jx != 0) {
+      unsigned long interval = map(abs(jx), 1, 100, 500, 60);
+      if (millis() - lastScrollX > interval) {
+        lastScrollX = millis();
+        if (jx < 0) {
+          int col = focusTile % TILE_COLS;
+          if (col > 0) { focusTile--; redraw = true; }
+        } else {
+          int col = focusTile % TILE_COLS;
+          if (col < TILE_COLS - 1) { focusTile++; redraw = true; }
+        }
+      }
+    } else {
+      lastScrollX = millis();
     }
-    if (jy < -TRIG) {
-      if (focusTile >= TILE_COLS) { focusTile -= TILE_COLS; redraw = true; }
-      delay(200);
-    } else if (jy > TRIG) {
-      if (focusTile < TILE_COUNT - TILE_COLS) { focusTile += TILE_COLS; redraw = true; }
-      delay(200);
+
+    if (jy != 0) {
+      unsigned long interval = map(abs(jy), 1, 100, 500, 60);
+      if (millis() - lastScrollY > interval) {
+        lastScrollY = millis();
+        if (jy < 0) {
+          if (focusTile >= TILE_COLS) { focusTile -= TILE_COLS; redraw = true; }
+        } else {
+          if (focusTile < TILE_COUNT - TILE_COLS) { focusTile += TILE_COLS; redraw = true; }
+        }
+      }
+    } else {
+      lastScrollY = millis();
     }
   }
 

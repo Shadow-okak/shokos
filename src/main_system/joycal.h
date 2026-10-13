@@ -10,8 +10,13 @@
 #define JOY_VRY_PIN      10
 #endif
 
-// ★ Главная настройка — процент мёртвой зоны
+// ---------- Настройки ----------
 #define JOY_DEADZONE_PERCENT  40
+#define JOY_EMA_ALPHA         0.4f
+#define JOY_CURVE_POW         2.0f
+#define JOY_DRIFT_TIMEOUT_MS  5000
+#define JOY_DRIFT_ALPHA       0.002f
+#define JOY_MOVE_THRESHOLD    60
 
 struct JoyCal {
   int xCenter  = 2048;
@@ -25,6 +30,8 @@ struct JoyCal {
 };
 
 static JoyCal joyCal;
+static float emaX = 0, emaY = 0;
+static bool  emaInited = false;
 
 // ---------- NVS ----------
 inline void loadJoyCal() {
@@ -57,36 +64,89 @@ inline void saveJoyCal() {
   prefs.end();
 }
 
-// ---------- Нормализация с 40% deadzone ----------
-inline int joyXNorm() {
-  int x = analogRead(JOY_VRX_PIN);
-  int half = min(joyCal.xCenter - joyCal.xMin, joyCal.xMax - joyCal.xCenter);
-  if (half < 100) half = 100;   // защита от некорректной калибровки
-  int dz = half * joyCal.deadzonePercent / 100;
-  int lowEdge  = joyCal.xCenter - dz;
-  int highEdge = joyCal.xCenter + dz;
+// ---------- Фильтрация ----------
+inline int median7(const int* v) {
+  int t[7];
+  for (int i = 0; i < 7; i++) t[i] = v[i];
+  for (int i = 0; i < 6; i++)
+    for (int j = 0; j < 6 - i; j++)
+      if (t[j] > t[j+1]) { int x = t[j]; t[j] = t[j+1]; t[j+1] = x; }
+  return t[3];
+}
 
-  if (x < lowEdge)  return map(x, joyCal.xMin, lowEdge, -100, 0);
-  if (x > highEdge) return map(x, highEdge, joyCal.xMax, 0, 100);
-  return 0;
+inline void readFiltered(int& outX, int& outY) {
+  int rx[7], ry[7];
+  for (int i = 0; i < 7; i++) {
+    rx[i] = analogRead(JOY_VRX_PIN);
+    ry[i] = analogRead(JOY_VRY_PIN);
+    delayMicroseconds(80);
+  }
+  int mx = median7(rx);
+  int my = median7(ry);
+  if (!emaInited) { emaX = mx; emaY = my; emaInited = true; }
+  emaX = JOY_EMA_ALPHA * mx + (1 - JOY_EMA_ALPHA) * emaX;
+  emaY = JOY_EMA_ALPHA * my + (1 - JOY_EMA_ALPHA) * emaY;
+  outX = (int)emaX;
+  outY = (int)emaY;
+}
+
+// ---------- Авто-центр ----------
+inline void updateAutoCenter(int x, int y) {
+  static int lastX = 0, lastY = 0;
+  static unsigned long lastMove = 0;
+
+  if (abs(x - lastX) > JOY_MOVE_THRESHOLD || abs(y - lastY) > JOY_MOVE_THRESHOLD) {
+    lastMove = millis();
+  }
+  if (millis() - lastMove > JOY_DRIFT_TIMEOUT_MS) {
+    joyCal.xCenter = joyCal.xCenter * (1 - JOY_DRIFT_ALPHA) + x * JOY_DRIFT_ALPHA;
+    joyCal.yCenter = joyCal.yCenter * (1 - JOY_DRIFT_ALPHA) + y * JOY_DRIFT_ALPHA;
+  }
+  lastX = x; lastY = y;
+}
+
+// ---------- Нормализация + кривая ----------
+inline int normAxis(int value, int center, int vmin, int vmax) {
+  int half = min(center - vmin, vmax - center);
+  if (half < 100) half = 100;
+  int dz = half * joyCal.deadzonePercent / 100;
+  int low  = center - dz;
+  int high = center + dz;
+
+  float t = 0.0f;
+  if (value < low)       t = (float)(value - low) / (low - vmin);
+  else if (value > high) t = (float)(value - high) / (vmax - high);
+  else return 0;
+
+  float s = powf(fabsf(t), JOY_CURVE_POW) * (t < 0 ? -1.0f : 1.0f);
+  return (int)(s * 100.0f);
+}
+
+inline int joyXNorm() {
+  int x, y;
+  readFiltered(x, y);
+  updateAutoCenter(x, y);
+  return normAxis(x, joyCal.xCenter, joyCal.xMin, joyCal.xMax);
 }
 
 inline int joyYNorm() {
-  int y = analogRead(JOY_VRY_PIN);
-  int half = min(joyCal.yCenter - joyCal.yMin, joyCal.yMax - joyCal.yCenter);
-  if (half < 100) half = 100;
-  int dz = half * joyCal.deadzonePercent / 100;
-  int lowEdge  = joyCal.yCenter - dz;
-  int highEdge = joyCal.yCenter + dz;
-
-  if (y < lowEdge)  return map(y, joyCal.yMin, lowEdge, -100, 0);
-  if (y > highEdge) return map(y, highEdge, joyCal.yMax, 0, 100);
-  return 0;
+  int x, y;
+  readFiltered(x, y);
+  updateAutoCenter(x, y);
+  return normAxis(y, joyCal.yCenter, joyCal.yMin, joyCal.yMax);
 }
 
-// ---------- Wizard калибровки ----------
+// ---------- Калибровка ----------
+inline int median21(int* v) {
+  for (int i = 1; i < 21; i++) {
+    int key = v[i], j = i - 1;
+    while (j >= 0 && v[j] > key) { v[j+1] = v[j]; j--; }
+    v[j+1] = key;
+  }
+  return v[10];
+}
+
 inline void runCalibration(LGFX_Sprite& spr) {
-  // === Фаза 1: центр (0.5 сек) ===
   spr.fillSprite(UI_BG);
   spr.setTextColor(UI_TEXT, UI_BG);
   spr.setTextSize(2);
@@ -101,34 +161,17 @@ inline void runCalibration(LGFX_Sprite& spr) {
   spr.print(">>> DO NOT TOUCH <<<");
   spr.pushSprite(0, 0);
 
-  long sx = 0, sy = 0;
-  int  n  = 0;
-  unsigned long t0 = millis();
-  while (millis() - t0 < 500) {
-    sx += analogRead(JOY_VRX_PIN);
-    sy += analogRead(JOY_VRY_PIN);
-    n++;
-    delay(5);
+  int sx[21], sy[21];
+  for (int i = 0; i < 21; i++) {
+    sx[i] = analogRead(JOY_VRX_PIN);
+    sy[i] = analogRead(JOY_VRY_PIN);
+    delay(10);
   }
-  joyCal.xCenter = sx / n;
-  joyCal.yCenter = sy / n;
+  joyCal.xCenter = median21(sx);
+  joyCal.yCenter = median21(sy);
 
-  // Замер шума (для лога, не для deadzone)
-  long noiseSum = 0;
-  n = 0;
-  t0 = millis();
-  while (millis() - t0 < 300) {
-    noiseSum += abs(analogRead(JOY_VRX_PIN) - joyCal.xCenter);
-    noiseSum += abs(analogRead(JOY_VRY_PIN) - joyCal.yCenter);
-    n += 2;
-    delay(5);
-  }
-  int avgNoise = noiseSum / n;
+  Serial.printf("Center: X=%d Y=%d\n", joyCal.xCenter, joyCal.yCenter);
 
-  Serial.printf("Center: X=%d Y=%d, noise=%d\n",
-                joyCal.xCenter, joyCal.yCenter, avgNoise);
-
-  // === Фаза 2: полный ход (1.5 сек) ===
   spr.fillRect(0, 60, 320, 100, UI_BG);
   spr.setTextColor(UI_TEXT, UI_BG);
   spr.setTextSize(1);
@@ -142,9 +185,9 @@ inline void runCalibration(LGFX_Sprite& spr) {
   joyCal.xMin = 4095; joyCal.xMax = 0;
   joyCal.yMin = 4095; joyCal.yMax = 0;
 
-  t0 = millis();
-  const unsigned long PHASE2_MS = 1500;
-  while (millis() - t0 < PHASE2_MS) {
+  unsigned long t0 = millis();
+  const unsigned long DURATION = 2000;
+  while (millis() - t0 < DURATION) {
     int x = analogRead(JOY_VRX_PIN);
     int y = analogRead(JOY_VRY_PIN);
     if (x < joyCal.xMin) joyCal.xMin = x;
@@ -152,7 +195,7 @@ inline void runCalibration(LGFX_Sprite& spr) {
     if (y < joyCal.yMin) joyCal.yMin = y;
     if (y > joyCal.yMax) joyCal.yMax = y;
 
-    int progress = (millis() - t0) * 280 / PHASE2_MS;
+    int progress = (millis() - t0) * 280 / DURATION;
     spr.drawRect(20, 110, 280, 20, UI_TEXT_DIM);
     spr.fillRect(21, 111, progress, 18, UI_ACCENT);
     spr.pushSprite(0, 0);
@@ -163,11 +206,10 @@ inline void runCalibration(LGFX_Sprite& spr) {
   joyCal.valid = true;
   saveJoyCal();
 
-  Serial.printf("Range X: %d..%d  Y: %d..%d  deadzone=%d%%\n",
+  Serial.printf("Range: X %d..%d  Y %d..%d  dz=%d%%\n",
                 joyCal.xMin, joyCal.xMax, joyCal.yMin, joyCal.yMax,
                 joyCal.deadzonePercent);
 
-  // === Итог ===
   spr.fillRect(0, 140, 320, 80, UI_BG);
   spr.setTextColor(UI_GREEN, UI_BG);
   spr.setTextSize(2);
@@ -180,8 +222,9 @@ inline void runCalibration(LGFX_Sprite& spr) {
   spr.printf("X %d..%d  Y %d..%d",
              joyCal.xMin, joyCal.xMax, joyCal.yMin, joyCal.yMax);
   spr.setCursor(20, 192);
-  spr.printf("Deadzone: %d%% of half-range", joyCal.deadzonePercent);
+  spr.printf("Curve ^%.1f  Deadzone %d%%",
+             JOY_CURVE_POW, joyCal.deadzonePercent);
 
   spr.pushSprite(0, 0);
-  delay(1200);
+  delay(1500);
 }
