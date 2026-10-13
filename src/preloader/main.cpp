@@ -19,7 +19,6 @@
 #define NEOPIXEL_PIN     48
 #define I2C_SDA          18
 #define I2C_SCL          8
-#define BOOT_BTN         0
 #define BUZZER_CHANNEL   0
 
 // ---------- Причины ----------
@@ -36,7 +35,7 @@ enum Reason {
 };
 
 const char* reasonStr[] = {
-  "none", "User button", "TFT fail", "I2C fail", "BME280 fail",
+  "none", "User request", "TFT fail", "I2C fail", "BME280 fail",
   "Joystick fail", "Buzzer fail", "LittleFS fail", "No OTA part"
 };
 
@@ -183,82 +182,6 @@ void drawRecoveryUI(Reason r, const String& detail, const String& ip,
   tft.setTextSize(2);
   tft.setCursor(logX + 35, btnY + 12);
   tft.print("LOG");
-}
-
-// ---------- Recovery Trigger (5-секундный таймаут) ----------
-bool checkRecoveryTrigger() {
-  pinMode(JOY_SW_PIN, INPUT_PULLUP);
-  pinMode(BOOT_BTN, INPUT_PULLUP);
-  delay(50);
-
-  // Звуковой сигнал старта
-  ledcSetup(BUZZER_CHANNEL, 2000, 8);
-  ledcAttachPin(BUZZER_PIN, BUZZER_CHANNEL);
-
-  tft.fillScreen(TFT_BLACK);
-  tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  tft.setTextSize(3);
-  tft.setCursor(10, 15);
-  tft.println("PRELOADER");
-  tft.drawFastHLine(0, 55, tft.width(), TFT_DARKGREY);
-
-  tft.setTextColor(TFT_YELLOW, TFT_BLACK);
-  tft.setTextSize(2);
-  tft.setCursor(10, 75);
-  tft.println("Press JOY SW for");
-  tft.setCursor(10, 105);
-  tft.println("RECOVERY mode");
-
-  tft.setTextColor(TFT_CYAN, TFT_BLACK);
-  tft.setCursor(10, 150);
-  tft.println("Auto-boot in:");
-
-  for (int i = 5; i > 0; i--) {
-    tft.fillRect(20, 180, 120, 55, TFT_BLACK);
-    tft.setTextColor(TFT_WHITE, TFT_BLACK);
-    tft.setTextSize(6);
-    tft.setCursor(40, 180);
-    tft.printf("%d", i);
-
-    // Один короткий писк на каждой секунде
-    ledcWriteTone(BUZZER_CHANNEL, 1500);
-    delay(30);
-    ledcWriteTone(BUZZER_CHANNEL, 0);
-
-    unsigned long t0 = millis();
-    while (millis() - t0 < 1000) {
-      if (digitalRead(JOY_SW_PIN) == LOW) {
-        Serial.println("JOY_SW -> RECOVERY");
-        tft.fillScreen(TFT_BLACK);
-        tft.setTextColor(TFT_GREEN, TFT_BLACK);
-        tft.setTextSize(3);
-        tft.setCursor(30, 100);
-        tft.println("RECOVERY!");
-        ledcWriteTone(BUZZER_CHANNEL, 2500);
-        delay(200);
-        ledcWriteTone(BUZZER_CHANNEL, 0);
-        delay(300);
-        return true;
-      }
-      if (digitalRead(BOOT_BTN) == LOW) {
-        Serial.println("BOOT -> RECOVERY");
-        tft.fillScreen(TFT_BLACK);
-        tft.setTextColor(TFT_GREEN, TFT_BLACK);
-        tft.setTextSize(3);
-        tft.setCursor(30, 100);
-        tft.println("RECOVERY!");
-        ledcWriteTone(BUZZER_CHANNEL, 2500);
-        delay(200);
-        ledcWriteTone(BUZZER_CHANNEL, 0);
-        delay(300);
-        return true;
-      }
-      delay(20);
-    }
-  }
-
-  Serial.println("Timeout -> boot main");
-  return false;
 }
 
 // ---------- Проверки ----------
@@ -410,7 +333,6 @@ void gotoRecovery(Reason r, const String& detail) {
 
   bool allowSkip = !isCritical(r);
   pinMode(JOY_SW_PIN, INPUT_PULLUP);
-  pinMode(BOOT_BTN, INPUT_PULLUP);
 
   String ipStr = "-";
   String wifiStatus = "connecting";
@@ -432,16 +354,13 @@ void gotoRecovery(Reason r, const String& detail) {
 
   int lastX = analogRead(JOY_VRX_PIN);
   int lastSW = HIGH;
-  int lastBoot = HIGH;
 
   while (true) {
     if (wifiOK) server.handleClient();
 
     int x = analogRead(JOY_VRX_PIN);
     int sw = digitalRead(JOY_SW_PIN);
-    int bootBtn = digitalRead(BOOT_BTN);
 
-    // Влево/вправо — выбор
     if (lastX >= 2000 && x < 1000) {
       recoverySelection = 0;
       drawRecoveryUI(r, detail, ipStr, wifiStatus, allowSkip);
@@ -452,17 +371,6 @@ void gotoRecovery(Reason r, const String& detail) {
     }
     lastX = x;
 
-    // BOOT = пропуск = boot main
-    if (lastBoot == HIGH && bootBtn == LOW) {
-      logAdd("BOOT -> boot main");
-      delay(50);
-      if (digitalRead(BOOT_BTN) == LOW) {
-        bootMain();
-      }
-    }
-    lastBoot = bootBtn;
-
-    // SW — навигация
     if (lastSW == HIGH && sw == LOW) {
       delay(20);
       if (digitalRead(JOY_SW_PIN) == LOW) {
@@ -485,35 +393,22 @@ void gotoRecovery(Reason r, const String& detail) {
 // ---------- Setup ----------
 void setup() {
   Serial.begin(115200);
-  delay(2000);
-  Serial.println("\n=== PRELOADER ===");
+  delay(300);
+  Serial.println("\n=== PRELOADER (RECOVERY MODE) ===");
   logAdd("=== PRELOADER ===");
 
-  pixel.begin(); pixel.setBrightness(64); setLed(0, 0, 255);
+  pixel.begin();
+  pixel.setBrightness(64);
+  setLed(255, 100, 0);
 
-  pinMode(TFT_BL_PIN, OUTPUT); digitalWrite(TFT_BL_PIN, HIGH);
+  pinMode(TFT_BL_PIN, OUTPUT);
+  digitalWrite(TFT_BL_PIN, HIGH);
 
   tft.init();
   tft.setRotation(1);
+  tft.fillScreen(TFT_BLACK);
 
-  // ★ 5-секундный таймаут: SW или BOOT → recovery
-  if (checkRecoveryTrigger()) {
-    logAdd("User requested RECOVERY");
-    gotoRecovery(R_USER_REQUEST, "User requested recovery");
-  }
-
-  String detail;
-  Reason r = runHealthChecks(detail);
-
-  if (r == R_NONE) {
-    logAdd("All checks OK -> boot main");
-    setLed(0, 255, 0);
-    delay(300);
-    bootMain();
-  }
-
-  logAdd(String("Health fail: ") + reasonStr[r] + " (" + detail + ")");
-  gotoRecovery(r, detail);
+  gotoRecovery(R_USER_REQUEST, "Manual entry from main");
 }
 
 void loop() {
